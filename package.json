@@ -1,0 +1,9 @@
+{
+  "name": "zftp-ml",
+  "packageManager": "yarn@3.6.3",
+  "main": "index.mjs",
+  "type": "module",
+  "dependencies": {
+    "@tensorflow/tfjs-node": "^4.11.0"
+  }
+}
