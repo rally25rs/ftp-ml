@@ -1,10 +1,15 @@
-import * as tf from '@tensorflow/tfjs';
+import * as tf from '@tensorflow/tfjs-node';
 import * as path from 'node:path';
 import * as url from 'node:url';
+import { linearRegression } from './regressions.mjs'
 
 const dirname = url.fileURLToPath(new URL('.', import.meta.url));
-const filename = `file://${dirname}/event.csv`;
+const filename = `file://${dirname}event.csv`;
 
+// usage: node index.mjs {model}
+const saveModelToFile = process.argv[2] ? `file://${dirname}${process.argv[2]}` : undefined;
+
+// mae 0.14
 const config1 = {
   optimizer: 'adam',
   loss: tf.losses.absoluteDifference,
@@ -12,10 +17,50 @@ const config1 = {
     tf.metrics.meanAbsoluteError,
   ],
   epochs: 300,
+  batch: 32,
   layers: (numOfFeatures => [
     tf.layers.dense({
       inputShape: [numOfFeatures],
-      units: Math.abs(numOfFeatures / 2)
+      units: Math.abs(numOfFeatures)
+    }),
+    tf.layers.dense({
+      units: 1
+    }),
+  ]),
+};
+
+// mae .196 mse .12
+const config1b = {
+  optimizer: 'adam',
+  loss: tf.losses.meanSquaredError,
+  metrics: [
+    tf.metrics.meanAbsoluteError,
+    tf.metrics.meanSquaredError,
+  ],
+  epochs: 700, //360,
+  layers: (numOfFeatures => [
+    tf.layers.dense({
+      inputShape: [numOfFeatures],
+      units: Math.abs(numOfFeatures)
+    }),
+    tf.layers.dense({
+      units: 1
+    }),
+  ]),
+};
+
+const config1c = {
+  optimizer: 'adam',
+  loss: tf.losses.meanSquaredError,
+  metrics: [
+    tf.metrics.meanAbsoluteError,
+    // tf.metrics.meanSquaredError,
+  ],
+  epochs: 400,
+  layers: (numOfFeatures => [
+    tf.layers.dense({
+      inputShape: [numOfFeatures],
+      units: Math.round(numOfFeatures / 2)
     }),
     tf.layers.dense({
       units: 1
@@ -77,7 +122,7 @@ const config4 = {
   ]),
 };
 
-// mse 6.6
+// mse 6.5
 const config5 = {
   optimizer: tf.OptimizerConstructors.adadelta(.0000002),
   loss: tf.losses.meanSquaredError,
@@ -124,9 +169,11 @@ const config7 = {
   ],
   epochs: 100,
   layers: (numOfFeatures => [
-    tf.layers.dense({
+    tf.layers.conv1d({
       inputShape: [numOfFeatures],
-      units: Math.round(numOfFeatures * 2)
+      units: Math.round(numOfFeatures * 2),
+      kernelSize: 2,
+      filters: 1,
     }),
     tf.layers.dense({
       units: 1
@@ -134,7 +181,7 @@ const config7 = {
   ]),
 };
 
-const config = config7;
+const config = config1;
 
 const powerColumnConfig = { isLabel: false, dtype: 'int32' };
 const csvDataset = tf.data.csv(
@@ -226,18 +273,47 @@ const csvDataset = tf.data.csv(
     configuredColumnsOnly: true,
   });
 
-const numOfFeatures = (await csvDataset.columnNames()).length - 1;
+const columnNames = await csvDataset.columnNames();
+const numOfFeatures = columnNames.length - 1;
+const logTimes = columnNames.map(n => parseInt(n)).filter(n => !isNaN(n)).map(n => Math.log(n));
+const backfillStart = logTimes.indexOf(Math.log(600)); // use linear regression from 10m+ to backfill zeros
+
+class StopEarly extends tf.Callback {
+  constructor() {
+    super();
+  }
+
+  async onEpochEnd(epoch, logs) {
+    if(logs.loss < .14) {
+      this.model.stopTraining = true;
+    }
+  }
+}
+
+function replaceZeros(powers) {
+  const regression = linearRegression(logTimes.slice(backfillStart), powers.slice(backfillStart));
+  for(let i = powers.length - 1; i >= 0; i--) {
+    if(powers[i] === 0) {
+      powers[i] = regression.slope * logTimes[i] + regression.intercept;
+    } else {
+      break;
+    }
+  }
+}
 
 // Prepare the Dataset for training.
-const flattenedDataset = csvDataset.map(({xs, ys}) =>
+let flattenedDataset = csvDataset.map(({xs, ys}) =>
   {
     // Convert xs(features) and ys(labels) from object form (keyed by column name) to array form.
-    return {xs:Object.values(xs), ys:Object.values(ys)};
-  }).batch(10);
+    const featureWkgs = Object.values(xs);
+    replaceZeros(featureWkgs);
+    return {xs:featureWkgs, ys:Object.values(ys)};
+  }).batch(config.batch || 32);
 
 // Define the model.
 const model = tf.sequential();
 config.layers(numOfFeatures).forEach(layer => model.add(layer));
+
 model.compile({
   optimizer: config.optimizer,
   loss: config.loss,
@@ -250,27 +326,25 @@ model.summary();
 await model.fitDataset(flattenedDataset, {
   epochs: config.epochs,
   callbacks: [
-    {
-      onEpochEnd: async (epoch, logs) => {
-        if(epoch % 10 === 0) {
-          console.log(epoch + ':' + JSON.stringify(logs));
-        }
-      },
-    },
+    new StopEarly(),
+    // {
+    //   onEpochEnd: async (epoch, logs) => {
+    //     if(epoch % 10 === 0) {
+    //       console.log(epoch + ':' + JSON.stringify(logs));
+    //     }
+    //   },
+    // },
     // tf.callbacks.earlyStopping({
     //   monitor: 'loss',
     //   patience: 5,
     // })
   ],
-
-  // callbacks: {
-  //   onEpochEnd: async (epoch, logs) => {
-  //     // if(epoch === epochs - 1) {
-  //       console.log(epoch + ':' + logs.loss);
-  //     // }
-  //   },
-  // }
 });
+
+if (saveModelToFile) {
+  await model.save(saveModelToFile);
+  console.log(`Saved model to ${saveModelToFile}`);
+}
 
 // 2582903,365,357,349,340,333,322,316,313,311,308,302,301,298,296,295,294,293,293,293,294,294,294,292,290,290,289,288,287,284,284,258,259,259,205,202,201,201,201,279
 model.predict(tf.tensor2d([[365,357,349,340,333,322,316,313,311,308,302,301,298,296,295,294,293,293,293,294,294,294,292,290,290,289,288,287,284,284,258,259,259,205,202,201,201,201]], [1, 38])).print();
